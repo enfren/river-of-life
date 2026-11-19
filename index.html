@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>The River of Life: An RPG Tale</title>
+<style>
+  * { margin: 0; padding: 0; }
+  html, body { overflow: hidden; height: 100%; background: #1a1a2e; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; top: 8px; left: 50%; transform: translateX(-50%);
+    color: #fff; font: 14px monospace; background: rgba(0,0,0,0.6);
+    padding: 5px 14px; border-radius: 4px; z-index: 10;
+    white-space: nowrap;
+  }
+  #checkpoint {
+    position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+    color: #FFD700; font: 14px monospace; background: rgba(0,0,0,0.6);
+    padding: 4px 12px; border-radius: 4px; z-index: 10;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hud">
+  ↑↓←→ move | Space shoot | HP: <span id="hp">10</span>/10 |
+  Kills: <span id="kills">0</span> | Coins: <span id="coins">0</span> |
+  Boss: <span id="boss">--</span>
+</div>
+<div id="checkpoint" style="display:none">Checkpoint saved!</div>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const WORLD_H = 6000;
+
+// --- Audio ---
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function playSound(freq, duration, type = 'square', vol = 0.15) {
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  gain.gain.value = vol;
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+}
+const sfx = {
+  shoot:    () => playSound(880, 0.08, 'square', 0.1),
+  hit:      () => playSound(220, 0.15, 'sawtooth', 0.2),
+  kill:     () => { playSound(440, 0.1, 'square', 0.15); setTimeout(() => playSound(660, 0.1, 'square', 0.15), 80); },
+  bossHit:  () => playSound(150, 0.2, 'sawtooth', 0.2),
+  bossKill: () => { [440,550,660,880].forEach((f,i) => setTimeout(() => playSound(f, 0.15, 'square', 0.2), i*100)); },
+  potion:   () => { playSound(523, 0.1, 'sine', 0.2); setTimeout(() => playSound(784, 0.15, 'sine', 0.2), 100); },
+  coin:     () => playSound(1200, 0.06, 'sine', 0.15),
+  checkpoint:() => { playSound(330, 0.1, 'sine', 0.15); setTimeout(() => playSound(440, 0.15, 'sine', 0.15), 120); },
+  phase:    () => { playSound(100, 0.3, 'sawtooth', 0.25); setTimeout(() => playSound(80, 0.4, 'sawtooth', 0.25), 200); },
+  slam:     () => playSound(60, 0.3, 'sawtooth', 0.3),
+  gameOver: () => { [440,330,220,110].forEach((f,i) => setTimeout(() => playSound(f, 0.2, 'sawtooth', 0.2), i*150)); }
+};
+
+// --- Player ---
+const player = {
+  x: 0, y: WORLD_H - 100,
+  w: 24, h: 36,
+  speed: 3, hp: 10, maxHp: 10,
+  shootCooldown: 0,
+  healTimer: 0, healRate: 120,
+  invulnTimer: 0
+};
+
+let camY = 0;
+let kills = 0, coins = 0;
+
+// --- River segments ---
+const riverSegments = [
+  { dir: 1, yStart: 4800, yEnd: 4200, thickness: 55, bridges: [W * 0.3, W * 0.7] },
+  { dir: -1, yStart: 3400, yEnd: 2800, thickness: 42, bridges: [W * 0.35, W * 0.65] },
+  { dir: 1, yStart: 2000, yEnd: 1500, thickness: 32, bridges: [W * 0.5] }
+];
+
+function riverCenterX(worldY) {
+  for (const seg of riverSegments) {
+    if (worldY >= seg.yEnd && worldY <= seg.yStart) {
+      const t = (seg.yStart - worldY) / (seg.yStart - seg.yEnd);
+      return seg.dir === 1 ? t * W : W - t * W;
+    }
+  }
+  return null;
+}
+
+const bridges = [];
+riverSegments.forEach(seg => {
+  seg.bridges.forEach(bx => {
+    const bridgeY = seg.dir === 1
+      ? seg.yStart - (bx / W) * (seg.yStart - seg.yEnd)
+      : seg.yStart - ((W - bx) / W) * (seg.yStart - seg.yEnd);
+    bridges.push({ x: bx, y: bridgeY, thickness: seg.thickness });
+  });
+});
+
+const checkpointYs = bridges.map(b => b.y);
+let lastCheckpoint = 0;
+
+// --- Trees ---
+const trees = [];
+for (let y = 100; y < WORLD_H - 100; y += 50 + Math.random() * 50) {
+  const rcx = riverCenterX(y);
+  if (rcx !== null) {
+    const seg = riverSegments.find(s => y >= s.yEnd && y <= s.yStart);
+    trees.push({ x: rcx - seg.thickness - 30 - Math.random() * 30, y });
+    trees.push({ x: rcx + seg.thickness + 30 + Math.random() * 30, y });
+  } else {
+    trees.push({ x: Math.random() * W, y });
+  }
+}
+
+// --- Mountains ---
+function genRange(count, minH, maxH, minW, maxW) {
+  const r = [];
+  for (let i = 0; i < count; i++) {
+    r.push({
+      y: i * (WORLD_H / count) + Math.random() * 100,
+      h: minH + Math.random() * (maxH - minH),
+      w: minW + Math.random() * (maxW - minW)
+    });
+  }
+  return r;
+}
+const mtnFar  = genRange(22, 50, 90, 70, 110);
+const mtnMid  = genRange(16, 80, 140, 90, 140);
+const mtnNear = genRange(12, 110, 190, 110, 180);
+
+// --- Enemies ---
+const shooters = [
+  { x: W * 0.4, y: 3900, w: 28, h: 40, dir: 1, speed: 1.5, shootTimer: 0, shootRate: 80, hp: 3, maxHp: 3, type: 'shooter' },
+  { x: W * 0.5, y: 3100, w: 28, h: 40, dir: -1, speed: 2, shootTimer: 40, shootRate: 70, hp: 3, maxHp: 3, type: 'shooter' },
+  { x: W * 0.6, y: 2300, w: 28, h: 40, dir: 1, speed: 1.8, shootTimer: 20, shootRate: 90, hp: 3, maxHp: 3, type: 'shooter' }
+];
+
+const walkers = [
+  { x: W * 0.3, y: 3600, w: 32, h: 32, speed: 1, hp: 4, maxHp: 4, type: 'walker', touchCd: 0 },
+  { x: W * 0.7, y: 2900, w: 32, h: 32, speed: 1.2, hp: 4, maxHp: 4, type: 'walker', touchCd: 0 },
+  { x: W * 0.4, y: 1900, w: 32, h: 32, speed: 1.3, hp: 4, maxHp: 4, type: 'walker', touchCd: 0 },
+  { x: W * 0.6, y: 1300, w: 32, h: 32, speed: 1.4, hp: 4, maxHp: 4, type: 'walker', touchCd: 0 }
+];
+
+// --- Boss (3 phases) ---
+const boss = {
+  x: W * 0.5, y: 300, w: 50, h: 60,
+  hp: 10, maxHp: 10, dir: -1, speed: 1.2,
+  shootTimer: 0, shootRate: 80, active: false,
+  phase: 1
+};
+
+// --- Items ---
+let items = [];
+
+// --- Projectiles ---
+let arrows = [], projectiles = [], slams = [];
+
+// --- Input ---
+const keys = {};
+document.addEventListener('keydown', e => { keys[e.code] = true; });
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+
+let gameOver = false, bossDefeated = false, frame = 0;
+player.x = W / 2;
+
+// --- Checkpoint ---
+function saveCheckpoint() {
+  const data = { y: player.y, hp: player.hp, kills, coins, frame };
+  localStorage.setItem('riverRogueSave', JSON.stringify(data));
+  const el = document.getElementById('checkpoint');
+  el.textContent = 'Checkpoint saved!';
+  el.style.display = 'block';
+  sfx.checkpoint();
+  setTimeout(() => { el.style.display = 'none'; }, 2000);
+}
+
+function loadCheckpoint() {
+  const raw = localStorage.getItem('riverRogueSave');
+  if (!raw) return false;
+  const data = JSON.parse(raw);
+  player.y = data.y;
+  player.hp = data.hp;
+  kills = data.kills;
+  coins = data.coins;
+  document.getElementById('hp').textContent = player.hp;
+  document.getElementById('kills').textContent = kills;
+  document.getElementById('coins').textContent = coins;
+  return true;
+}
+
+if (localStorage.getItem('riverRogueSave')) {
+  document.getElementById('checkpoint').textContent = 'Save found! Press R to resume.';
+  document.getElementById('checkpoint').style.display = 'block';
+}
+
+document.addEventListener('keydown', e => {
+  if (e.code === 'KeyR' && localStorage.getItem('riverRogueSave')) {
+    loadCheckpoint();
+    document.getElementById('checkpoint').style.display = 'none';
+  }
+});
+
+function checkCheckpoint() {
+  for (const cpY of checkpointYs) {
+    if (lastCheckpoint < cpY && player.y < cpY) {
+      lastCheckpoint = cpY;
+      saveCheckpoint();
+      break;
+    }
+  }
+}
+
+// --- Drops ---
+function dropItems(x, y) {
+  if (Math.random() < 0.5) items.push({ x: x - 6, y, type: 'potion' });
+  if (Math.random() < 0.7) items.push({ x: x + 10, y, type: 'coin' });
+}
+
+function update() {
+  if (gameOver) return;
+  frame++;
+
+  if (keys['ArrowUp'] || keys['KeyW']) player.y -= player.speed;
+  if (keys['ArrowDown'] || keys['KeyS']) player.y += player.speed;
+  if (keys['ArrowLeft'] || keys['KeyA']) player.x -= player.speed;
+  if (keys['ArrowRight'] || keys['KeyD']) player.x += player.speed;
+  player.x = Math.max(0, Math.min(W - player.w, player.x));
+  player.y = Math.max(0, Math.min(WORLD_H - player.h, player.y));
+
+  if (player.invulnTimer > 0) player.invulnTimer--;
+
+  if (player.shootCooldown > 0) player.shootCooldown--;
+  if (keys['Space'] && player.shootCooldown <= 0) {
+    projectiles.push({ x: player.x + player.w / 2, y: player.y, vy: -8 });
+    player.shootCooldown = 18;
+    sfx.shoot();
+  }
+
+  player.healTimer++;
+  if (player.healTimer >= player.healRate && player.hp < player.maxHp) {
+    player.healTimer = 0;
+    player.hp++;
+    document.getElementById('hp').textContent = player.hp;
+  }
+
+  camY = Math.max(0, Math.min(WORLD_H - H, player.y - H * 0.75));
+  checkCheckpoint();
+
+  // --- Shooters ---
+  shooters.forEach(ob => {
+    ob.x += ob.speed * ob.dir;
+    if (ob.x < 30 || ob.x > W - ob.w - 30) ob.dir *= -1;
+    ob.shootTimer++;
+    if (ob.shootTimer >= ob.shootRate) {
+      ob.shootTimer = 0;
+      const dx = player.x - ob.x, dy = player.y - ob.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      arrows.push({ x: ob.x + ob.w / 2, y: ob.y + ob.h, vx: (dx / dist) * 3.5, vy: (dy / dist) * 3.5, fromBoss: false });
+    }
+  });
+
+  // --- Walkers ---
+  walkers.forEach(wk => {
+    if (wk.touchCd > 0) wk.touchCd--;
+    const dx = player.x - wk.x, dy = player.y - wk.y;
+    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+    if (dist < 400) {
+      wk.x += (dx / dist) * wk.speed;
+      wk.y += (dy / dist) * wk.speed;
+    }
+    if (player.invulnTimer <= 0 &&
+        player.x < wk.x + wk.w && player.x + player.w > wk.x &&
+        player.y < wk.y + wk.h && player.y + player.h > wk.y) {
+      player.hp--;
+      player.invulnTimer = 45;
+      player.healTimer = 0;
+      document.getElementById('hp').textContent = player.hp;
+      sfx.hit();
+      if (player.hp <= 0) { player.hp = 0; gameOver = true; sfx.gameOver(); }
+    }
+  });
+
+  // --- Boss ---
+  if (!boss.active && player.y < 800) boss.active = true;
+  if (boss.active && !bossDefeated) {
+    if (boss.phase === 1 && boss.hp <= 6) { boss.phase = 2; boss.speed = 2; boss.shootRate = 60; sfx.phase(); }
+    if (boss.phase === 2 && boss.hp <= 3) { boss.phase = 3; boss.speed = 2.8; boss.shootRate = 45; sfx.phase(); }
+
+    boss.x += boss.speed * boss.dir;
+    if (boss.x < 80 || boss.x > W - boss.w - 80) boss.dir *= -1;
+
+    boss.shootTimer++;
+    if (boss.shootTimer >= boss.shootRate) {
+      boss.shootTimer = 0;
+      let spreadCount = boss.phase === 1 ? 2 : boss.phase === 2 ? 3 : 4;
+      let spreadAngle = boss.phase === 1 ? 0.4 : boss.phase === 2 ? 0.45 : 0.55;
+      let arrowSpeed = boss.phase === 1 ? 3 : boss.phase === 2 ? 3.5 : 4;
+      for (let a = -Math.floor(spreadCount / 2); a <= Math.floor(spreadCount / 2); a++) {
+        const dx = player.x - boss.x, dy = player.y - boss.y;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        const angle = Math.atan2(dy, dx) + a * spreadAngle;
+        arrows.push({ x: boss.x + boss.w / 2, y: boss.y + boss.h, vx: Math.cos(angle) * arrowSpeed, vy: Math.sin(angle) * arrowSpeed, fromBoss: true });
+      }
+      // Slam: every other volley
+      if (frame % 2 === 0) {
+        slams.push({ x: boss.x + boss.w / 2 - 25, y: boss.y + boss.h, w: 50, h: 60, vy: 7 });
+        sfx.slam();
+      }
+      // Phase 3: occasional teleport
+      if (boss.phase === 3 && Math.random() < 0.3) {
+        boss.x = Math.max(80, Math.min(W - boss.w - 80, player.x + (Math.random() - 0.5) * 100));
+      }
+    }
+  }
+
+  // --- Arrows ---
+  arrows = arrows.filter(a => {
+    a.x += a.vx; a.y += a.vy;
+    if (player.invulnTimer <= 0 &&
+        a.x > player.x && a.x < player.x + player.w &&
+        a.y > player.y && a.y < player.y + player.h) {
+      player.hp -= (a.fromBoss ? 2 : 1);
+      player.healTimer = 0;
+      player.invulnTimer = 20;
+      document.getElementById('hp').textContent = player.hp;
+      sfx.hit();
+      if (player.hp <= 0) { player.hp = 0; gameOver = true; sfx.gameOver(); }
+      return false;
+    }
+    return a.y > camY - 50 && a.y < camY + H + 50 && a.x > -50 && a.x < W + 50;
+  });
+
+  // --- Slams ---
+  slams = slams.filter(s => {
+    s.y += s.vy;
+    if (player.invulnTimer <= 0 &&
+        player.x < s.x + s.w && player.x + player.w > s.x &&
+        player.y < s.y + s.h && player.y + player.h > s.y) {
+      player.hp -= 2;
+      player.healTimer = 0;
+      player.invulnTimer = 30;
+      document.getElementById('hp').textContent = player.hp;
+      sfx.hit();
+      if (player.hp <= 0) { player.hp = 0; gameOver = true; sfx.gameOver(); }
+      return false;
+    }
+    return s.y < camY + H + 100;
+  });
+
+  // --- Projectiles ---
+  projectiles = projectiles.filter(p => {
+    p.y += p.vy;
+    for (let i = shooters.length - 1; i >= 0; i--) {
+      const ob = shooters[i];
+      if (p.x > ob.x && p.x < ob.x + ob.w && p.y > ob.y && p.y < ob.y + ob.h) {
+        ob.hp--;
+        if (ob.hp <= 0) {
+          dropItems(ob.x + ob.w / 2, ob.y);
+          shooters.splice(i, 1);
+          kills++;
+          document.getElementById('kills').textContent = kills;
+          sfx.kill();
+        } else { sfx.bossHit(); }
+        return false;
+      }
+    }
+    for (let i = walkers.length - 1; i >= 0; i--) {
+      const wk = walkers[i];
+      if (p.x > wk.x && p.x < wk.x + wk.w && p.y > wk.y && p.y < wk.y + wk.h) {
+        wk.hp--;
+        if (wk.hp <= 0) {
+          dropItems(wk.x + wk.w / 2, wk.y);
+          walkers.splice(i, 1);
+          kills++;
+          document.getElementById('kills').textContent = kills;
+          sfx.kill();
+        } else { sfx.bossHit(); }
+        return false;
+      }
+    }
+    if (boss.active && !bossDefeated && p.x > boss.x && p.x < boss.x + boss.w && p.y > boss.y && p.y < boss.y + boss.h) {
+      boss.hp--;
+      document.getElementById('boss').textContent = boss.hp;
+      sfx.bossHit();
+      if (boss.hp <= 0) {
+        bossDefeated = true;
+        document.getElementById('boss').textContent = 'DEFEATED';
+        sfx.bossKill();
+        for (let i = 0; i < 5; i++) items.push({ x: boss.x + i * 10, y: boss.y, type: 'coin' });
+        items.push({ x: boss.x + boss.w / 2, y: boss.y, type: 'potion' });
+      }
+      return false;
+    }
+    return p.y > camY - 50;
+  });
+
+  // --- Items ---
+  items = items.filter(it => {
+    if (player.x < it.x + 12 && player.x + player.w > it.x &&
+        player.y < it.y + 12 && player.y + player.h > it.y) {
+      if (it.type === 'potion') {
+        player.hp = Math.min(player.maxHp, player.hp + 3);
+        document.getElementById('hp').textContent = player.hp;
+        sfx.potion();
+      } else {
+        coins++;
+        document.getElementById('coins').textContent = coins;
+        sfx.coin();
+      }
+      return false;
+    }
+    return it.y > camY - 50;
+  });
+}
+
+// --- Drawing ---
+function drawMountain(mx, my, mw, mh, bodyColor, snowLine) {
+  ctx.fillStyle = bodyColor;
+  ctx.beginPath();
+  ctx.moveTo(mx - mw / 2, my + mh);
+  ctx.lineTo(mx, my);
+  ctx.lineTo(mx + mw / 2, my + mh);
+  ctx.closePath();
+  ctx.fill();
+  const snowH = mh * snowLine;
+  const snowW = mw * (snowH / mh) * 0.85;
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.moveTo(mx, my);
+  ctx.lineTo(mx - snowW / 2, my + snowH);
+  for (let i = 0; i <= 4; i++) {
+    const t = i / 4;
+    ctx.lineTo(mx - snowW / 2 + snowW * t, my + snowH + (i % 2 === 0 ? 0 : -4));
+  }
+  ctx.lineTo(mx + snowW / 2, my + snowH);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#87CEEB');
+  sky.addColorStop(0.4, '#b8d8f0');
+  sky.addColorStop(1, '#d4edda');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, H);
+
+  // Mountains
+  mtnFar.forEach(m => {
+    const my = m.y - camY * 0.2;
+    if (my < -m.h - 20 || my > H + 20) return;
+    drawMountain(m.y * 0.1 + 10, my, m.w * 0.7, m.h * 0.7, '#8faabf', 0.35);
+    drawMountain(W - m.y * 0.1 - 10, my, m.w * 0.7, m.h * 0.7, '#8faabf', 0.35);
+  });
+  mtnMid.forEach(m => {
+    const my = m.y - camY * 0.4;
+    if (my < -m.h - 20 || my > H + 20) return;
+    drawMountain(m.y * 0.15 + 10, my, m.w * 0.85, m.h * 0.85, '#5B7B9A', 0.3);
+    drawMountain(W - m.y * 0.15 - 10, my, m.w * 0.85, m.h * 0.85, '#5B7B9A', 0.3);
+  });
+  mtnNear.forEach(m => {
+    const my = m.y - camY * 0.6;
+    if (my < -m.h - 20 || my > H + 20) return;
+    drawMountain(m.y * 0.2 + 10, my, m.w, m.h, '#3d5a73', 0.25);
+    drawMountain(W - m.y * 0.2 - 10, my, m.w, m.h, '#3d5a73', 0.25);
+  });
+
+  // Ground
+  ctx.fillStyle = '#4a7c3f';
+  ctx.fillRect(0, 0, W, H);
+
+  // Rivers
+  ctx.fillStyle = '#3a7bd5';
+  riverSegments.forEach(seg => {
+    ctx.beginPath();
+    let started = false;
+    for (let wy = seg.yStart; wy >= seg.yEnd; wy -= 8) {
+      const sx = riverCenterX(wy);
+      const sy = wy - camY;
+      if (sy < -20 || sy > H + 20) continue;
+      if (!started) { ctx.moveTo(sx - seg.thickness, sy); started = true; }
+      else ctx.lineTo(sx - seg.thickness, sy);
+    }
+    for (let wy = seg.yEnd; wy <= seg.yStart; wy += 8) {
+      const sx = riverCenterX(wy);
+      const sy = wy - camY;
+      if (sy < -20 || sy > H + 20) continue;
+      ctx.lineTo(sx + seg.thickness, sy);
+    }
+    ctx.closePath();
+    ctx.fill();
+  });
+
+  // River flow lines
+  ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+  ctx.lineWidth = 1;
+  riverSegments.forEach(seg => {
+    for (let wy = seg.yStart; wy >= seg.yEnd; wy -= 30) {
+      const sx = riverCenterX(wy);
+      const sy = wy - camY;
+      if (sy > -10 && sy < H + 10) {
+        ctx.beginPath();
+        ctx.moveTo(sx - 10 * seg.dir, sy);
+        ctx.lineTo(sx + 10 * seg.dir, sy);
+        ctx.stroke();
+      }
+    }
+  });
+
+  // Bridges
+  bridges.forEach(b => {
+    const sy = b.y - camY;
+    if (sy < -30 || sy > H + 30) return;
+    const len = b.thickness + 20;
+    ctx.fillStyle = '#8B4513';
+    ctx.fillRect(b.x - 12, sy - len, 24, len * 2);
+    ctx.fillStyle = '#654321';
+    ctx.fillRect(b.x - 14, sy - len, 4, len * 2);
+    ctx.fillRect(b.x + 10, sy - len, 4, len * 2);
+    ctx.strokeStyle = '#5a3a1a';
+    ctx.lineWidth = 2;
+    for (let py = sy - len; py < sy + len; py += 12) {
+      ctx.beginPath();
+      ctx.moveTo(b.x - 10, py);
+      ctx.lineTo(b.x + 10, py);
+      ctx.stroke();
+    }
+  });
+
+  // Trees
+  trees.forEach(t => {
+    const ty = t.y - camY;
+    if (ty < -60 || ty > H + 60) return;
+    ctx.fillStyle = '#5D4037';
+    ctx.fillRect(t.x - 3, ty - 25, 6, 25);
+    ctx.fillStyle = '#2E7D32';
+    ctx.beginPath();
+    ctx.moveTo(t.x, ty - 55);
+    ctx.lineTo(t.x - 14, ty - 22);
+    ctx.lineTo(t.x + 14, ty - 22);
+    ctx.closePath();
+    ctx.fill();
+  });
+
+  // Shooters
+  shooters.forEach(ob => {
+    const oy = ob.y - camY;
+    if (oy < -50 || oy > H + 50) return;
+    ctx.fillStyle = '#FF5722';
+    ctx.fillRect(ob.x, oy, ob.w, ob.h);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(ob.x + 7, oy + 8, 7, 7);
+    ctx.fillStyle = '#333';
+    ctx.fillRect(ob.x, oy - 8, ob.w, 5);
+    ctx.fillStyle = '#f44336';
+    ctx.fillRect(ob.x, oy - 8, ob.w * (ob.hp / ob.maxHp), 5);
+  });
+
+  // Walkers
+  walkers.forEach(wk => {
+    const wy = wk.y - camY;
+    if (wy < -50 || wy > H + 50) return;
+    ctx.fillStyle = '#4a148c';
+    ctx.beginPath();
+    ctx.arc(wk.x + wk.w / 2, wy + wk.h / 2, wk.w / 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#FF1744';
+    ctx.fillRect(wk.x + 6, wy + 8, 8, 6);
+    ctx.fillRect(wk.x + wk.w - 14, wy + 8, 8, 6);
+    ctx.fillStyle = '#333';
+    ctx.fillRect(wk.x, wy - 8, wk.w, 5);
+    ctx.fillStyle = '#7C4DFF';
+    ctx.fillRect(wk.x, wy - 8, wk.w * (wk.hp / wk.maxHp), 5);
+  });
+
+  // Boss
+  if (boss.active) {
+    const by = boss.y - camY;
+    if (by > -100 && by < H + 100) {
+      const bossColor = bossDefeated ? '#555' : boss.phase === 1 ? '#B71C1C' : boss.phase === 2 ? '#7B1FA2' : '#FF6F00';
+      ctx.fillStyle = bossColor;
+      ctx.fillRect(boss.x, by, boss.w, boss.h);
+      ctx.fillStyle = boss.phase === 3 ? '#FF1744' : '#FFEB3B';
+      ctx.fillRect(boss.x + 8, by + 10, 10, 10);
+      ctx.fillRect(boss.x + 32, by + 10, 10, 10);
+      if (boss.phase === 3 && !bossDefeated) {
+        ctx.fillStyle = 'rgba(255,100,0,0.4)';
+        ctx.beginPath();
+        ctx.arc(boss.x + boss.w / 2, by + boss.h / 2, boss.w, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      if (!bossDefeated) {
+        ctx.fillStyle = '#333';
+        ctx.fillRect(boss.x, by - 14, boss.w, 8);
+        ctx.fillStyle = boss.phase === 1 ? '#f00' : boss.phase === 2 ? '#9C27B0' : '#FF6F00';
+        ctx.fillRect(boss.x, by - 14, boss.w * (boss.hp / boss.maxHp), 8);
+        ctx.fillStyle = '#fff';
+        ctx.font = '10px monospace';
+        ctx.fillText('P' + boss.phase, boss.x + boss.w / 2 - 8, by - 18);
+      }
+    }
+  }
+
+  // Items
+  items.forEach(it => {
+    const iy = it.y - camY;
+    if (iy < -20 || iy > H + 20) return;
+    if (it.type === 'potion') {
+      ctx.fillStyle = '#E91E63';
+      ctx.fillRect(it.x, iy, 12, 12);
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(it.x + 4, iy + 2, 4, 8);
+      ctx.fillRect(it.x + 2, iy + 4, 8, 4);
+    } else {
+      ctx.fillStyle = '#FFD700';
+      ctx.beginPath();
+      ctx.arc(it.x + 6, iy + 6, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#FFA000';
+      ctx.font = '8px monospace';
+      ctx.fillText('$', it.x + 3, iy + 9);
+    }
+  });
+
+  // Arrows
+  ctx.strokeStyle = '#FFC107';
+  ctx.lineWidth = 2;
+  arrows.forEach(a => {
+    const ay = a.y - camY;
+    ctx.beginPath();
+    ctx.moveTo(a.x, ay);
+    ctx.lineTo(a.x - a.vx * 3, ay - a.vy * 3);
+    ctx.stroke();
+  });
+
+  // Slams
+  slams.forEach(s => {
+    const sy = s.y - camY;
+    if (sy < -80 || sy > H + 80) return;
+    ctx.fillStyle = '#5D4037';
+    ctx.beginPath();
+    ctx.moveTo(s.x + s.w / 2, sy);
+    ctx.lineTo(s.x + s.w, sy + s.h * 0.3);
+    ctx.lineTo(s.x + s.w * 0.8, sy + s.h);
+    ctx.lineTo(s.x + s.w * 0.2, sy + s.h);
+    ctx.lineTo(s.x, sy + s.h * 0.3);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = '#8D6E63';
+    ctx.fillRect(s.x + s.w * 0.3, sy + s.h * 0.2, s.w * 0.4, s.h * 0.3);
+  });
+
+  // Projectiles
+  ctx.fillStyle = '#00E5FF';
+  projectiles.forEach(p => {
+    const py = p.y - camY;
+    ctx.fillRect(p.x - 2, py, 4, 12);
+  });
+
+  // Player avatar
+  const py = player.y - camY;
+  if (player.invulnTimer <= 0 || frame % 8 < 4) {
+    ctx.fillStyle = '#1565C0';
+    ctx.fillRect(player.x, py, player.w, player.h);
+    ctx.fillStyle = '#FFCC80';
+    ctx.beginPath();
+    ctx.arc(player.x + player.w / 2, py - 8, 10, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#000';
+    ctx.fillRect(player.x + 6, py - 10, 3, 3);
+    ctx.fillRect(player.x + 14, py - 10, 3, 3);
+    ctx.strokeStyle = '#B0BEC5';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(player.x + player.w / 2, py);
+    ctx.lineTo(player.x + player.w / 2, py - 20);
+    ctx.stroke();
+  }
+
+  // Player HP bar
+  const barW = 36, barH = 6;
+  const barX = player.x + player.w / 2 - barW / 2;
+  const barY = py - 22;
+  ctx.fillStyle = '#333';
+  ctx.fillRect(barX, barY, barW, barH);
+  const hpPct = player.hp / player.maxHp;
+  ctx.fillStyle = hpPct > 0.5 ? '#4CAF50' : hpPct > 0.25 ? '#FF9800' : '#f44336';
+  ctx.fillRect(barX, barY, barW * hpPct, barH);
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(barX, barY, barW, barH);
+
+  // Overlays
+  if (gameOver) {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff';
+    ctx.font = '48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('GAME OVER', W / 2, H / 2);
+    ctx.font = '16px monospace';
+    ctx.fillText(`Kills: ${kills} | Coins: ${coins}`, W / 2, H / 2 + 35);
+    ctx.fillText('Press R to resume from checkpoint', W / 2, H / 2 + 60);
+  }
+  if (bossDefeated && !gameOver) {
+    ctx.fillStyle = '#FFD700';
+    ctx.font = '28px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('VICTORY!', W / 2, 60);
+    ctx.font = '16px monospace';
+    ctx.fillText(`Kills: ${kills} | Coins: ${coins}`, W / 2, 90);
+  }
+}
+
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>   
