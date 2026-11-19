@@ -8,9 +8,9 @@ A single-file HTML5 canvas roguelike. Walk north through a mountain valley, cros
 
 ## Screenshots
 
-| Valley | River Crossing |
-|---|---|
-| ![Valley](screenshots/valley.png) | ![River](screenshots/river.png) |
+| Valley | River Crossing | Boss Fight | Victory |
+|---|---|---|---|
+| ![Valley](screenshots/valley.png) | ![River](screenshots/river.png) | ![Boss](screenshots/boss.png) | ![Victory](screenshots/victory.png) |
 
 ## Features
 
@@ -48,6 +48,4 @@ A single-file HTML5 canvas roguelike. Walk north through a mountain valley, cros
 - [ ] Sprite art (replace canvas primitives)
 - [ ] Multiple levels / procedurally generated maps
 - [ ] Inventory system (spend coins on upgrades)
-- [ ] Mobile touch controls
-
-
+- [ ] Mobile touch controls 
